@@ -2,6 +2,8 @@ package pricing
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 
@@ -14,6 +16,8 @@ type CloudPricingProvider struct {
 	azure         *AzureProvider
 	fallback      *StaticProvider
 	customPricing *CustomPricing
+	userTable     *UserPriceTable
+	strict        bool
 	cloudOnce     sync.Once
 	detectedCloud collector.CloudProvider
 }
@@ -40,10 +44,42 @@ func (p *CloudPricingProvider) SetCustomPricing(cp *CustomPricing) {
 	p.customPricing = cp
 }
 
-const (
-	spotFallbackMultiplier = 0.21
-	hoursPerMonth          = 730.0 // 365 * 24 / 12
-)
+// SetUserPriceTable configures an explicit user price table. It takes
+// precedence over every online, embedded and estimated source, but only for the
+// instance types it declares; everything else continues down the normal chain.
+func (p *CloudPricingProvider) SetUserPriceTable(t *UserPriceTable) {
+	p.userTable = t
+}
+
+// SetStrict makes pricing refuse estimates. In strict mode a lookup that can
+// only be satisfied by the instance-suffix estimator returns ErrPricingStrict
+// instead of a made-up number. Callers that price many nodes should aggregate
+// these errors and fail once, rather than logging per node.
+func (p *CloudPricingProvider) SetStrict(strict bool) {
+	p.strict = strict
+}
+
+// ErrPricingStrict is returned (wrapped) when a price can only be estimated and
+// strict mode is enabled.
+var ErrPricingStrict = errors.New("strict pricing: no exact price available")
+
+// ErrPricingStrict wraps an estimate-only result for an instance type.
+type EstimateError struct {
+	Cloud        string
+	Region       string
+	InstanceType string
+	IsSpot       bool
+}
+
+func (e *EstimateError) Error() string {
+	kind := "on-demand"
+	if e.IsSpot {
+		kind = "spot"
+	}
+	return fmt.Sprintf("%s: %s/%s/%s %s price can only be estimated", ErrPricingStrict, e.Cloud, e.Region, e.InstanceType, kind)
+}
+
+func (e *EstimateError) Unwrap() error { return ErrPricingStrict }
 
 func (p *CloudPricingProvider) detectCloud(node collector.NodeInfo) {
 	p.cloudOnce.Do(func() {
@@ -65,64 +101,102 @@ func (p *CloudPricingProvider) GetHourlyPrice(ctx context.Context, instanceType,
 	return p.hourlyPrice(ctx, instanceType, region, "", isSpot)
 }
 
-func (p *CloudPricingProvider) hourlyPrice(ctx context.Context, instanceType, region, zone string, isSpot bool) (float64, error) {
-	cloudName := ""
+// cloudName maps the detected cloud to a catalog key.
+func (p *CloudPricingProvider) cloudName() string {
 	switch p.detectedCloud {
 	case collector.CloudAWS:
-		cloudName = "aws"
+		return "aws"
 	case collector.CloudAzure:
-		cloudName = "azure"
+		return "azure"
 	case collector.CloudGCP:
-		cloudName = "gcp"
+		return "gcp"
+	default:
+		return ""
+	}
+}
+
+func (p *CloudPricingProvider) hourlyPrice(ctx context.Context, instanceType, region, zone string, isSpot bool) (float64, error) {
+	price, _, _, err := p.resolveHourly(ctx, instanceType, region, zone, isSpot)
+	return price, err
+}
+
+// resolveHourly returns the hourly price, the layer that supplied it, and
+// whether a default region was substituted for the requested one.
+//
+// Priority (first hit wins): user table, live cloud API, embedded catalog,
+// instance-suffix estimate. The user table only covers the instance types it
+// declares; everything else falls through unchanged.
+func (p *CloudPricingProvider) resolveHourly(ctx context.Context, instanceType, region, zone string, isSpot bool) (float64, PriceSource, bool, error) {
+	cloudName := p.cloudName()
+
+	if price, ok := p.userTable.lookup(cloudName, region, instanceType, isSpot); ok {
+		return price, PriceSourceUser, false, nil
 	}
 
-	if isSpot {
+	// Drill-down into a single source. Each layer reports whether it produced a
+	// price; errors are intentionally swallowed so the chain can continue.
+	apiPrice := func() (float64, bool) {
 		switch p.detectedCloud {
 		case collector.CloudAWS:
 			p.initAWS(ctx)
 			if p.aws != nil {
-				if price, err := p.aws.getHourlyPrice(ctx, instanceType, region, zone, true); err == nil {
-					return price, nil
+				if price, err := p.aws.getHourlyPrice(ctx, instanceType, region, zone, isSpot); err == nil {
+					return price, true
 				}
 			}
 		case collector.CloudAzure:
-			if price, err := p.azure.GetHourlyPrice(ctx, instanceType, region, true); err == nil {
-				return price, nil
+			if price, err := p.azure.GetHourlyPrice(ctx, instanceType, region, isSpot); err == nil {
+				return price, true
 			}
 		}
-		if cloudName != "" {
-			if price, err := GetEmbeddedPrice(cloudName, region, instanceType); err == nil {
-				savings, _, ok := lookupSpotAdvisor(instanceType, region)
-				if ok && savings > 0 {
-					return price * (1 - float64(savings)/100.0), nil
-				}
-				return price * spotFallbackMultiplier, nil
-			}
-		}
-		return p.fallback.GetHourlyPrice(ctx, instanceType, region, true)
+		return 0, false
 	}
 
-	switch p.detectedCloud {
-	case collector.CloudAWS:
-		p.initAWS(ctx)
-		if p.aws != nil {
-			if price, err := p.aws.GetHourlyPrice(ctx, instanceType, region, false); err == nil {
-				return price, nil
-			}
-		}
-	case collector.CloudAzure:
-		if price, err := p.azure.GetHourlyPrice(ctx, instanceType, region, false); err == nil {
-			return price, nil
-		}
+	if price, ok := apiPrice(); ok {
+		return price, PriceSourceAPI, false, nil
 	}
 
 	if cloudName != "" {
-		if price, err := GetEmbeddedPrice(cloudName, region, instanceType); err == nil {
-			return price, nil
+		if price, fallback, err := LookupEmbeddedPrice(cloudName, region, instanceType); err == nil {
+			if !isSpot {
+				return price, PriceSourceEmbedded, fallback, nil
+			}
+			// Spot from embedded on-demand: apply advisor discount when known,
+			// otherwise the historical fallback multiplier. These are mutually
+			// exclusive, never stacked.
+			savings, _, ok := lookupSpotAdvisor(instanceType, region)
+			if ok && savings > 0 {
+				return price * (1 - float64(savings)/100.0), PriceSourceEmbedded, fallback, nil
+			}
+			return price * SpotFallbackMultiplier, PriceSourceEmbedded, fallback, nil
 		}
 	}
 
-	return p.fallback.GetHourlyPrice(ctx, instanceType, region, false)
+	// Final layer: static table / suffix estimate.
+	price, source := p.fallback.lookup(instanceType, region, isSpot)
+	// A static-table hit for an unknown region means the default-region prices
+	// were reused, so mark the fallback. Estimations are region-independent.
+	// Unknown-cloud/on-prem nodes have no meaningful region, so do not flag
+	// them.
+	_, regionKnown := p.fallback.prices[region]
+	regionFallback := cloudName != "" && region != "" && !regionKnown && source == PriceSourceEmbedded
+	if source == PriceSourceEstimated {
+		cloudForErr := cloudName
+		if cloudForErr == "" {
+			cloudForErr = "unknown"
+		}
+		est := &EstimateError{
+			Cloud:        cloudForErr,
+			Region:       region,
+			InstanceType: instanceType,
+			IsSpot:       isSpot,
+		}
+		if p.strict {
+			return 0, source, regionFallback, est
+		}
+		slog.Debug("pricing used an estimate", "instance_type", instanceType, "region", region, "spot", isSpot)
+	}
+	return price, source, regionFallback, nil
 }
 
 func (p *CloudPricingProvider) GetNodePricing(ctx context.Context, node collector.NodeInfo) (*NodePricing, error) {
@@ -131,6 +205,7 @@ func (p *CloudPricingProvider) GetNodePricing(ctx context.Context, node collecto
 			CPUCostPerCore: p.customPricing.CPUCostPerCoreHr,
 			RAMCostPerGiB:  p.customPricing.RAMCostPerGiBHr,
 			GPUCostPerUnit: p.customPricing.GPUCostPerHr,
+			Source:         PriceSourceCustom,
 		}
 		cpuCores := float64(node.CPUAllocatable) / 1000.0
 		ramGiB := float64(node.MemAllocatable) / (1024 * 1024 * 1024)
@@ -138,7 +213,8 @@ func (p *CloudPricingProvider) GetNodePricing(ctx context.Context, node collecto
 		return np, nil
 	}
 
-	hourly, err := p.GetHourlyPriceForNode(ctx, node)
+	p.detectCloud(node)
+	hourly, source, regionFallback, err := p.resolveHourly(ctx, node.InstanceType, node.Region, node.Zone, node.IsSpot)
 	if err != nil {
 		return nil, err
 	}
@@ -150,6 +226,8 @@ func (p *CloudPricingProvider) GetNodePricing(ctx context.Context, node collecto
 			CPUCostPerCore: cpuPerCore,
 			RAMCostPerGiB:  ramPerGiB,
 			GPUCostPerUnit: gpuPerUnit,
+			Source:         source,
+			RegionFallback: regionFallback,
 		}, nil
 	}
 
@@ -158,6 +236,8 @@ func (p *CloudPricingProvider) GetNodePricing(ctx context.Context, node collecto
 		HourlyTotal:    hourly,
 		CPUCostPerCore: cpuPerCore,
 		RAMCostPerGiB:  ramPerGiB,
+		Source:         source,
+		RegionFallback: regionFallback,
 	}, nil
 }
 
@@ -230,8 +310,8 @@ func (p *CloudPricingProvider) GetRISaving(ctx context.Context, instanceType, re
 		if err != nil {
 			return 0, 0, false
 		}
-		riMonthly := riHourly * hoursPerMonth
-		odMonthly := odHourly * hoursPerMonth
+		riMonthly := riHourly * HoursPerMonth
+		odMonthly := odHourly * HoursPerMonth
 		saving = odMonthly - riMonthly
 		if saving > 0 {
 			return saving, saving / odMonthly * 100, true
@@ -245,7 +325,7 @@ func (p *CloudPricingProvider) GetRISaving(ctx context.Context, instanceType, re
 		if err != nil {
 			return 0, 0, false
 		}
-		odMonthly := odHourly * hoursPerMonth
+		odMonthly := odHourly * HoursPerMonth
 		saving = odMonthly - riMonthly
 		if saving > 0 {
 			return saving, saving / odMonthly * 100, true

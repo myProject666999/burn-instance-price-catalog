@@ -1,0 +1,31 @@
+# Example user price table for `burn analyze --price-table`.
+#
+# Precedence is: user table -> live cloud API -> embedded catalog ->
+# instance-suffix estimate. Only the instance types listed under a region are
+# overridden; every other instance type keeps using the normal chain.
+#
+# Discounts are explicit and never composed:
+#   - on_demand_discount applies only to on-demand prices
+#   - spot_discount applies only to declared spot prices
+#   - family rules win over global defaults; two discounts are never multiplied
+#   - both must be in [0, 1); negative prices are rejected
+
+# Global defaults, overridable per instance family.
+defaults:
+  on_demand_discount: 0.10
+
+families:
+  m5:
+    # Negotiated enterprise rate on this family's on-demand price.
+    on_demand_discount: 0.20
+
+regions:
+  us-east-1:
+    m5.large:
+      on_demand: 0.096   # required, USD per hour
+    c5.large:
+      on_demand: 0.085
+      spot: 0.030        # optional; omit to fall through for spot lookups
+  eu-west-1:
+    m5.large:
+      on_demand: 0.107

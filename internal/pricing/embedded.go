@@ -48,80 +48,132 @@ func loadYAML(path string) map[string]map[string]float64 {
 	return prices
 }
 
-func (p *priceDB) getAWSPrice(region, instanceType string) (float64, bool) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-
-	if p.aws == nil {
-		return 0, false
+// regionPrice looks up a price and reports whether the requested region was
+// missing and the default region was used instead.
+func regionPrice(prices map[string]map[string]float64, region, instanceType, fallbackRegion string) (price float64, fallback bool, ok bool) {
+	if prices == nil {
+		return 0, false, false
 	}
-	regionPrices, ok := p.aws[region]
-	if !ok {
-		regionPrices, ok = p.aws["us-east-1"]
-		if !ok {
-			return 0, false
+	regionPrices, exists := prices[region]
+	fallback = false
+	if !exists {
+		regionPrices, exists = prices[fallbackRegion]
+		if !exists {
+			return 0, false, false
 		}
+		fallback = true
 	}
-	price, ok := regionPrices[instanceType]
-	return price, ok
+	price, ok = regionPrices[instanceType]
+	return price, fallback, ok
 }
 
-func (p *priceDB) getAzurePrice(region, vmSize string) (float64, bool) {
+func (p *priceDB) getAWSPrice(region, instanceType string) (float64, bool, bool) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-
-	if p.azure == nil {
-		return 0, false
-	}
-	regionPrices, ok := p.azure[region]
-	if !ok {
-		regionPrices, ok = p.azure["eastus"]
-		if !ok {
-			return 0, false
-		}
-	}
-	price, ok := regionPrices[vmSize]
-	return price, ok
+	return regionPrice(p.aws, region, instanceType, defaultRegions["aws"])
 }
 
-func (p *priceDB) getGCPPrice(region, machineType string) (float64, bool) {
+func (p *priceDB) getAzurePrice(region, vmSize string) (float64, bool, bool) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-
-	if p.gcp == nil {
-		return 0, false
-	}
-	regionPrices, ok := p.gcp[region]
-	if !ok {
-		regionPrices, ok = p.gcp["us-central1"]
-		if !ok {
-			return 0, false
-		}
-	}
-	price, ok := regionPrices[machineType]
-	return price, ok
+	return regionPrice(p.azure, region, vmSize, defaultRegions["azure"])
 }
 
-// GetEmbeddedPrice returns the price from embedded YAML data
+func (p *priceDB) getGCPPrice(region, machineType string) (float64, bool, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return regionPrice(p.gcp, region, machineType, defaultRegions["gcp"])
+}
+
+// GetEmbeddedPrice returns the price from embedded YAML data.
+//
+// When the requested region is absent the default region's entry is used; this
+// preserves the historical behaviour but the caller cannot tell it happened.
+// Prefer LookupEmbeddedPrice when the fallback matters.
 func GetEmbeddedPrice(cloud, region, instanceType string) (float64, error) {
+	price, _, err := LookupEmbeddedPrice(cloud, region, instanceType)
+	return price, err
+}
+
+// LookupEmbeddedPrice returns the embedded price and whether the region was
+// substituted with the cloud's default region.
+func LookupEmbeddedPrice(cloud, region, instanceType string) (float64, bool, error) {
 	db := loadPriceDB()
+	cloud = normalizeCloud(cloud)
 
 	var price float64
-	var ok bool
+	var fallback, ok bool
 
 	switch cloud {
 	case "aws":
-		price, ok = db.getAWSPrice(region, instanceType)
+		price, fallback, ok = db.getAWSPrice(region, instanceType)
 	case "azure":
-		price, ok = db.getAzurePrice(region, instanceType)
+		price, fallback, ok = db.getAzurePrice(region, instanceType)
 	case "gcp":
-		price, ok = db.getGCPPrice(region, instanceType)
+		price, fallback, ok = db.getGCPPrice(region, instanceType)
 	default:
-		return 0, fmt.Errorf("unknown cloud: %s", cloud)
+		return 0, false, fmt.Errorf("unknown cloud: %s", cloud)
 	}
 
 	if !ok {
-		return 0, fmt.Errorf("price not found for %s/%s/%s", cloud, region, instanceType)
+		return 0, false, fmt.Errorf("price not found for %s/%s/%s", cloud, region, instanceType)
 	}
-	return price, nil
+	return price, fallback, nil
+}
+
+// validateEmbeddedData checks the embedded catalogs for duplicate keys and
+// negative prices. It is wired into tests via TestEmbeddedCatalogIntegrity and
+// can be called at startup for defence in depth.
+func validateEmbeddedData() error {
+	for _, path := range []string{"data/aws.yaml", "data/azure.yaml", "data/gcp.yaml"} {
+		data, err := priceData.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if err := validatePriceYAML(data); err != nil {
+			return fmt.Errorf("%s: %w", path, err)
+		}
+	}
+	return nil
+}
+
+func validatePriceYAML(data []byte) error {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return err
+	}
+	if len(doc.Content) == 0 {
+		return nil
+	}
+	root := doc.Content[0]
+	if root.Kind != yaml.MappingNode {
+		return at(root, "expected a mapping of region to prices")
+	}
+	seenRegions := map[string]*yaml.Node{}
+	for i := 0; i < len(root.Content); i += 2 {
+		regionKey, regionVal := root.Content[i], root.Content[i+1]
+		if prev, ok := seenRegions[regionKey.Value]; ok {
+			return duplicateKeyError("region", regionKey, prev)
+		}
+		seenRegions[regionKey.Value] = regionKey
+		if regionVal.Kind != yaml.MappingNode {
+			return at(regionVal, "region %q must map instance types to numbers", regionKey.Value)
+		}
+		seenTypes := map[string]*yaml.Node{}
+		for j := 0; j < len(regionVal.Content); j += 2 {
+			typeKey, typeVal := regionVal.Content[j], regionVal.Content[j+1]
+			if prev, ok := seenTypes[typeKey.Value]; ok {
+				return duplicateKeyError("instance type", typeKey, prev)
+			}
+			seenTypes[typeKey.Value] = typeKey
+			price, err := parseFloatNode(typeVal)
+			if err != nil {
+				return err
+			}
+			if price < 0 {
+				return at(typeVal, "negative price %v for %s/%s", price, regionKey.Value, typeKey.Value)
+			}
+		}
+	}
+	return nil
 }

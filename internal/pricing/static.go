@@ -23,17 +23,26 @@ func (p *StaticProvider) SetRegion(region string) {
 	p.region = region
 }
 
-
 func (p *StaticProvider) GetHourlyPrice(_ context.Context, instanceType, region string, isSpot bool) (float64, error) {
+	price, _ := p.lookup(instanceType, region, isSpot)
+	return price, nil
+}
+
+// lookup returns the static price and its source, optionally estimating from
+// the instance suffix. Estimation is reported as PriceSourceEstimated so
+// callers can refuse it in strict mode.
+func (p *StaticProvider) lookup(instanceType, region string, isSpot bool) (float64, PriceSource) {
 	regionPrices, ok := p.prices[region]
 	if !ok {
 		regionPrices = p.prices["us-east-1"] // fallback to us-east-1 prices
 	}
 
+	source := PriceSourceEmbedded
 	price, ok := regionPrices[instanceType]
 	if !ok {
 		// Try to estimate price based on instance family
 		price = estimatePrice(instanceType)
+		source = PriceSourceEstimated
 		slog.Warn("using estimated pricing for unknown instance type",
 			"instance_type", instanceType,
 			"region", region,
@@ -42,9 +51,9 @@ func (p *StaticProvider) GetHourlyPrice(_ context.Context, instanceType, region 
 	}
 
 	if isSpot {
-		return price * spotFallbackMultiplier, nil
+		return price * SpotFallbackMultiplier, source
 	}
-	return price, nil
+	return price, source
 }
 
 // estimatePrice returns a rough estimate for unknown instance types based on naming patterns
@@ -111,28 +120,28 @@ func (p *StaticProvider) GetSpotDiscount(_ context.Context, instanceType, region
 	savings, ir, ok := lookupSpotAdvisor(instanceType, region)
 	if ok && savings > 0 {
 		return SpotDiscount{
-			Discount:        float64(savings) / 100.0,
+			Discount:         float64(savings) / 100.0,
 			InterruptionRate: ir,
-			Source:          "advisor",
+			Source:           "advisor",
 		}
 	}
 	return SpotDiscount{
-		Discount:        0,
+		Discount:         0,
 		InterruptionRate: -1,
-		Source:          "unavailable",
+		Source:           "unavailable",
 	}
 }
 
 func (p *StaticProvider) GetNodePricing(ctx context.Context, node collector.NodeInfo) (*NodePricing, error) {
-	hourly, err := p.GetHourlyPriceForNode(ctx, node)
-	if err != nil {
-		return nil, err
-	}
+	hourly, source := p.lookup(node.InstanceType, node.Region, node.IsSpot)
+	_, regionKnown := p.prices[node.Region]
 	cpuPerCore, ramPerGiB := SplitNodeCost(hourly, node.CPUAllocatable, node.MemAllocatable)
 	return &NodePricing{
 		HourlyTotal:    hourly,
 		CPUCostPerCore: cpuPerCore,
 		RAMCostPerGiB:  ramPerGiB,
+		Source:         source,
+		RegionFallback: node.Region != "" && !regionKnown,
 	}, nil
 }
 

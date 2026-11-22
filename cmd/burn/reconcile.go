@@ -59,6 +59,8 @@ func init() {
 	f.StringVar(&azureSubscription, "azure-subscription", "", "Azure subscription ID (or AZURE_SUBSCRIPTION_ID env)")
 	f.StringVar(&azureCostType, "cost-type", "amortized", "Azure cost type (amortized|actual)")
 	f.IntVar(&dataDelayHours, "data-delay", 48, "billing data delay in hours (default 48, use 72 for Azure PAYG)")
+	f.StringVar(&priceTable, "price-table", "", "path to a user price table YAML (overrides cloud pricing for the instance types it declares)")
+	f.BoolVar(&strictPricing, "strict-pricing", false, "fail instead of estimating prices for unknown instance types")
 	f.BoolVarP(&verbose, "verbose", "v", false, "verbose output")
 
 	rootCmd.AddCommand(reconcileCmd)
@@ -114,6 +116,10 @@ func runReconcile(cmd *cobra.Command, _ []string) error {
 
 	pp, err := pricing.NewCloudPricingProvider(ctx)
 	if err != nil {
+		return err
+	}
+
+	if err := applyPricingOptions(pp); err != nil {
 		return err
 	}
 

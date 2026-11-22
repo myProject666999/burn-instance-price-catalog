@@ -26,6 +26,8 @@ func init() {
 	f.StringVar(&kubecontext, "context", "", "kubeconfig context to use")
 	f.StringVar(&prometheusURL, "prometheus", "", "Prometheus server URL")
 	f.StringVar(&period, "period", "", "default analysis period (e.g. 1h, 7d, 30d)")
+	f.StringVar(&priceTable, "price-table", "", "path to a user price table YAML (overrides cloud pricing for the instance types it declares)")
+	f.BoolVar(&strictPricing, "strict-pricing", false, "fail instead of estimating prices for unknown instance types")
 
 	rootCmd.AddCommand(mcpCmd)
 }
@@ -39,6 +41,10 @@ func runMCP(_ *cobra.Command, _ []string) error {
 
 	pp, err := pricing.NewCloudPricingProvider(ctx)
 	if err != nil {
+		return err
+	}
+
+	if err := applyPricingOptions(pp); err != nil {
 		return err
 	}
 

@@ -41,6 +41,8 @@ var (
 	gpuPrice      float64
 	storagePrice  float64
 	showSpot      bool
+	priceTable    string
+	strictPricing bool
 )
 
 var analyzeCmd = &cobra.Command{
@@ -66,8 +68,23 @@ func init() {
 	f.Float64Var(&gpuPrice, "gpu-price", 0, "custom GPU price per unit per hour (on-prem)")
 	f.Float64Var(&storagePrice, "storage-price", 0, "custom storage price per GiB per month (on-prem)")
 	f.BoolVar(&showSpot, "spot", false, "show spot instance readiness details")
+	f.StringVar(&priceTable, "price-table", "", "path to a user price table YAML (overrides cloud pricing for the instance types it declares)")
+	f.BoolVar(&strictPricing, "strict-pricing", false, "fail instead of estimating prices for unknown instance types")
 
 	rootCmd.AddCommand(analyzeCmd)
+}
+
+// applyPricingOptions configures the user price table and strict mode.
+func applyPricingOptions(pp *pricing.CloudPricingProvider) error {
+	if priceTable != "" {
+		table, err := pricing.LoadUserPriceTable(priceTable)
+		if err != nil {
+			return fmt.Errorf("load price table: %w", err)
+		}
+		pp.SetUserPriceTable(table)
+	}
+	pp.SetStrict(strictPricing)
+	return nil
 }
 
 func runAnalyze(cmd *cobra.Command, _ []string) error {
@@ -105,6 +122,10 @@ func runAnalyze(cmd *cobra.Command, _ []string) error {
 
 	pp, err := pricing.NewCloudPricingProvider(ctx)
 	if err != nil {
+		return err
+	}
+
+	if err := applyPricingOptions(pp); err != nil {
 		return err
 	}
 
@@ -290,6 +311,14 @@ func outputTable(report *analyzer.CostReport) {
 	}
 	w.Flush()
 
+	// Only surface the price source when it is something the user opted into
+	// (a price table) or an assumption they should know about (a region
+	// fallback). With no such conditions the output is byte-for-byte unchanged.
+	notices := priceSourceNotices(report.Nodes)
+	for _, line := range notices {
+		fmt.Fprintln(os.Stderr, line)
+	}
+
 	if len(report.Namespaces) > 0 {
 		outputNamespaceSummary(report.Namespaces, hasPrometheus, report.MonthlyCost, report.TotalIdleCost)
 	}
@@ -443,6 +472,29 @@ func outputNamespacePods(pods []analyzer.PodEfficiency, hasPrometheus bool, pvcs
 		}
 		w.Flush()
 	}
+}
+
+// priceSourceNotices returns stderr lines summarising price provenance, or nil
+// when every node used the ordinary cloud/embedded path. Keeping this quiet in
+// the common case means output is unchanged when no user table is supplied.
+func priceSourceNotices(nodes []analyzer.NodeCost) []string {
+	var userCount, fallbackCount int
+	for _, n := range nodes {
+		if n.PriceSource == string(pricing.PriceSourceUser) {
+			userCount++
+		}
+		if n.RegionFallback {
+			fallbackCount++
+		}
+	}
+	var notices []string
+	if userCount > 0 {
+		notices = append(notices, fmt.Sprintf("ℹ %d node(s) priced from the user price table.", userCount))
+	}
+	if fallbackCount > 0 {
+		notices = append(notices, fmt.Sprintf("ℹ %d node(s) priced using a default-region fallback (requested region absent from the catalog).", fallbackCount))
+	}
+	return notices
 }
 
 func interruptionLabel(rate int) string {

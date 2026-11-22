@@ -1,6 +1,10 @@
 package billing
 
-import "time"
+import (
+	"time"
+
+	"github.com/tanrikuluozlem/burn/internal/pricing"
+)
 
 type AthenaConfig struct {
 	Database       string
@@ -10,9 +14,10 @@ type AthenaConfig struct {
 	Region         string
 }
 
-// AWS billing uses 730 hours/month for cost projection.
-const HoursPerMonth = 730.0
-const DaysPerMonth = HoursPerMonth / 24.0
+// AWS billing uses the shared 730-hour projection month for cost projection.
+// It deliberately does not track real calendar months.
+const HoursPerMonth = pricing.HoursPerMonth
+const DaysPerMonth = pricing.DaysPerMonth
 
 // Resource categories for billing classification
 const (

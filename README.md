@@ -270,9 +270,14 @@ AWS CUR / Azure  → actual billing data for reconciliation (optional)
 
 | Priority | Source | When |
 |----------|--------|------|
-| 1 | AWS/Azure pricing API | Live, region-aware when credentials are available |
-| 2 | Embedded pricing DB | AWS, Azure, and GCP instances; AWS and Azure updated weekly via CI |
-| 3 | Static fallback | Estimates based on instance family for unknown types |
+| 1 | User price table | Explicit `--price-table` YAML; overrides the instance types it declares |
+| 2 | AWS/Azure pricing API | Live, region-aware when credentials are available |
+| 3 | Embedded pricing DB | AWS, Azure, and GCP instances; AWS and Azure updated weekly via CI |
+| 4 | Static fallback | Estimates based on instance family for unknown types |
+
+Each node reports which layer priced it. Without a user table the output is
+unchanged. The embedded lookup falls back to each cloud's default region when a
+region is missing, and marks the node accordingly.
 
 Storage and load balancer costs are fetched from cloud APIs when available, with static fallbacks. Usage-based charges (data processing, LCU) depend on traffic volume and are not included. GPU nodes are detected automatically and priced via ratio-based cost splitting.
 
@@ -368,8 +373,77 @@ spec:
 | `--days` | Number of days to reconcile (default: 7) |
 | `--cost-type` | Azure cost type: `amortized` or `actual` (default: amortized) |
 | `--data-delay` | Billing data delay in hours (default: 48; AWS CUR ~24h, Azure EA/MCA 8-24h, Azure PAYG up to 72h) |
+| `--price-table` | User price table YAML; takes precedence over cloud pricing for the instance types it declares |
+| `--strict-pricing` | Fail (with a list of all affected nodes) instead of estimating prices for unknown instance types |
 
 AWS and Azure clusters use live cloud pricing automatically. GCP clusters use embedded pricing. On-prem pricing flags are for clusters where cloud pricing is not available.
+
+### User price table
+
+A user price table lets you pin prices (e.g. negotiated enterprise rates) without
+re-implementing online collection. It is keyed by region and instance type, and
+only the instance types it declares are overridden — everything else continues
+through the normal chain.
+
+```yaml
+# enterprise-prices.yaml
+defaults:
+  on_demand_discount: 0.10      # global on-demand discount, [0, 1)
+families:
+  m5:
+    on_demand_discount: 0.20    # more specific: family discount wins, not stacked
+regions:
+  us-east-1:
+    m5.large:
+      on_demand: 0.096          # required, hourly USD
+    c5.large:
+      on_demand: 0.085
+      spot: 0.030               # optional; omit to fall through for spot lookups
+```
+
+Source priority is **user table → live cloud API → embedded catalog → instance-suffix
+estimate**. Each node records which layer priced it.
+
+Discount rules are explicit and never composed:
+
+- `on_demand_discount` applies only to on-demand prices.
+- `spot_discount` applies only to declared spot prices.
+- On-demand discounts never apply to spot, and a user spot price is never
+  multiplied by the `0.21` fallback or by Spot Advisor savings.
+- Only the most specific rule fires (family over global); two discounts are
+  never multiplied together.
+- Discounts must be in `[0, 1)`; negative prices are rejected. (Whether a zero
+  price must carry an explicit "free" marker is still an open question.)
+
+Loading validates duplicate keys, numeric types, and positions; a repeated key is
+an error naming both lines, never a silent last-write-wins.
+
+**Commitment coverage.** Kubernetes cannot tell which specific nodes a
+commitment covers, so consumption is blended: at coverage 4 of 6 nodes, four pay
+the commitment rate and two pay on-demand, and the reported figure is their
+weighted average. Coverage must be in `[0, 1]`. The output never claims a
+particular node received the commitment.
+
+**Region fallback.** If a requested region is absent from the catalog the default
+region is used (`us-east-1`, `eastus`, `us-central1`) and the node is marked as a
+region fallback. In strict mode, an instance type that can only be estimated is
+reported for every affected node together, and the run fails.
+
+### Billing timing
+
+`billing.BillableSeconds` is a pure function of a node's live interval, a
+statistics window, a minimum charge, and a rounding granularity. It returns the
+billable seconds for the window:
+
+- A node created inside the window bills only its remaining lifetime.
+- The minimum charge is applied once, in the window that observes the node's
+  death, computed from total lifetime — never re-charged per window.
+- A zero creation time bills the whole window and is flagged as unknown.
+- An optional whole-hour rounding rounds up to the configured granularity.
+
+AWS Linux on-demand (60s minimum) and GCP (1-minute minimum) are examples of
+explicit billing configuration, not defaults applied to every instance or OS.
+
 
 ## Development
 

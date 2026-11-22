@@ -40,6 +40,12 @@ type NodeCost struct {
 	HourlyPrice  float64
 	MonthlyPrice float64
 	PodCount     int
+	// PriceSource identifies which pricing layer produced MonthlyPrice. Empty
+	// for providers that do not report a source.
+	PriceSource string `json:"price_source,omitempty"`
+	// RegionFallback is true when the price came from a different region than
+	// the node's own (e.g. the embedded catalog served us-east-1).
+	RegionFallback bool `json:"region_fallback,omitempty"`
 
 	// Per-resource cost rates
 	CPUCostPerCore float64 `json:"cpu_cost_per_core,omitempty"`

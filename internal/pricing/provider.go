@@ -6,11 +6,35 @@ import (
 	"github.com/tanrikuluozlem/burn/internal/collector"
 )
 
+// PriceSource identifies which layer supplied a node's hourly price. The zero
+// value is intentionally "unknown" so that unchanged call sites keep working.
+type PriceSource string
+
+const (
+	// PriceSourceUser is an explicit user price table entry.
+	PriceSourceUser PriceSource = "user"
+	// PriceSourceAPI is a live cloud pricing API.
+	PriceSourceAPI PriceSource = "api"
+	// PriceSourceEmbedded is the embedded YAML catalog.
+	PriceSourceEmbedded PriceSource = "embedded"
+	// PriceSourceEstimated is the instance-suffix estimate fallback.
+	PriceSourceEstimated PriceSource = "estimated"
+	// PriceSourceCustom is on-prem per-core/per-GiB custom pricing.
+	PriceSourceCustom PriceSource = "custom"
+)
+
 type NodePricing struct {
 	HourlyTotal    float64
 	CPUCostPerCore float64
 	RAMCostPerGiB  float64
 	GPUCostPerUnit float64
+	// Source records where HourlyTotal came from. Empty for providers that do
+	// not report a source.
+	Source PriceSource
+	// RegionFallback is true when the price came from a different region than
+	// the one requested (e.g. an embedded catalog served us-east-1 for an
+	// unknown region). The request still succeeds, but callers can surface it.
+	RegionFallback bool
 }
 
 type CustomPricing struct {

@@ -2,6 +2,7 @@ package analyzer
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"math"
 	"sort"
@@ -12,7 +13,9 @@ import (
 )
 
 const (
-	hoursPerMonth    = 730.0
+	// hoursPerMonth aliases the canonical projection month so analyzer and
+	// pricing never drift apart.
+	hoursPerMonth    = pricing.HoursPerMonth
 	highIdlePercent  = 0.4
 	maxPodEfficiency = 10
 )
@@ -44,9 +47,18 @@ func (a *Analyzer) Analyze(ctx context.Context, info *collector.ClusterInfo) (*C
 	var skipped int
 	var allPods []PodEfficiency
 
+	// Strict-mode pricing failures are collected and reported together, not
+	// logged one node at a time. A single estimate-only node must fail the run.
+	var strictErrs []error
+
 	for _, node := range info.Nodes {
 		nc, pods, err := a.calculateNodeCost(ctx, node, hasPrometheus)
 		if err != nil {
+			if errors.Is(err, pricing.ErrPricingStrict) {
+				strictErrs = append(strictErrs, err)
+				skipped++
+				continue
+			}
 			slog.Warn("failed to calculate node cost",
 				"node", node.Name,
 				"instance_type", node.InstanceType,
@@ -79,6 +91,10 @@ func (a *Analyzer) Analyze(ctx context.Context, info *collector.ClusterInfo) (*C
 
 	if len(report.Nodes) < 2 {
 		report.WasteAnalysis.PotentialSavings = 0
+	}
+
+	if len(strictErrs) > 0 {
+		return nil, &StrictPricingError{Failures: strictErrs}
 	}
 
 	report.HourlyCost = totalHourly
@@ -220,6 +236,8 @@ func (a *Analyzer) calculateNodeCost(ctx context.Context, node collector.NodeInf
 		HourlyPrice:     np.HourlyTotal,
 		MonthlyPrice:    np.HourlyTotal * hoursPerMonth,
 		PodCount:        len(node.Pods),
+		PriceSource:     string(np.Source),
+		RegionFallback:  np.RegionFallback,
 		CPUCostPerCore:  np.CPUCostPerCore,
 		RAMCostPerGiB:   np.RAMCostPerGiB,
 		GPUCostPerUnit:  np.GPUCostPerUnit,
